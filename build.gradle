@@ -1,42 +1,26 @@
-buildscript {
-    repositories {
-        mavenCentral()
-        gradlePluginPortal()
-    }
-}
-
 plugins {
-    id 'net.researchgate.release' version '2.8.1'
-    id 'com.sourcemuse.mongo' version '2.0.0'       // newer, Java-17 friendly
+    id 'net.researchgate.release' version '3.1.0'
+    id 'com.sourcemuse.mongo' version '2.0.0'
+    id 'maven-publish'
+    id 'java'
+    id 'groovy'
+    id 'idea'
+    id 'eclipse'
 }
 
-allprojects {
-    repositories { mavenCentral() }
-    apply plugin: 'maven-publish'
-    apply plugin: 'java'
-}
-
-apply plugin: 'eclipse'
-apply plugin: 'groovy'
-apply plugin: 'idea'
-apply plugin: 'com.sourcemuse.mongo'
-
+group = 'io.github.riteshsingh2204'
 archivesBaseName = 'quartz-mongodb'
+// version is read from gradle.properties
 
 java {
-    // Use Java 17 everywhere
-    toolchain {
-        languageVersion = JavaLanguageVersion.of(17)
-    }
+    toolchain { languageVersion = JavaLanguageVersion.of(17) }
     withSourcesJar()
     withJavadocJar()
 }
 
-jar {
-    // expects gradle.properties to define: projectVersion=...
-    archiveVersion = projectVersion
-}
+repositories { mavenCentral() }
 
+// --- Optional "provided" scope (kept for compatibility) ---
 configurations {
     provided
     implementation.extendsFrom provided
@@ -45,6 +29,7 @@ sourceSets {
     main { compileClasspath += configurations.provided }
 }
 
+// --- IDE helpers ---
 idea {
     module {
         scopes.PROVIDED.plus += [configurations.provided]
@@ -52,7 +37,6 @@ idea {
         downloadSources = true
     }
 }
-
 eclipse {
     classpath {
         downloadSources true
@@ -64,50 +48,42 @@ eclipse {
     }
 }
 
+// --- Dependencies (Java 17 friendly, current stable lines) ---
 dependencies {
-    // --- Runtime / compile ---
-    implementation("org.quartz-scheduler:quartz:2.5.0")                // Quartz latest stable
-    implementation("org.mongodb:mongodb-driver-sync:5.6.0")            // MongoDB Java driver (sync)
+    implementation("org.quartz-scheduler:quartz:2.5.0")
+    implementation("org.mongodb:mongodb-driver-sync:5.6.0")
     implementation("commons-codec:commons-codec:1.19.0")
     implementation("org.apache.commons:commons-lang3:3.19.0")
     implementation("org.slf4j:slf4j-api:2.0.17")
+    implementation("org.apache.httpcomponents:httpclient:4.5.14")
 
-    // If you truly need Apache HTTP components, prefer Core5:
+    // Prefer HttpCore5 instead of legacy 4.x (uncomment if needed)
     // implementation("org.apache.httpcomponents.core5:httpcore5:5.3.6")
 
-    // --- Optional “provided” examples (keep if you need) ---
     compileOnly("org.clojure:clojure:1.11.3")
 
-    // --- Test stack (Java 17 compatible) ---
     testImplementation(platform("org.junit:junit-bom:5.11.3"))
     testImplementation("org.junit.jupiter:junit-jupiter")
-
-    // Groovy & Spock on Groovy 4 for JDK17
     testImplementation("org.apache.groovy:groovy-all:4.0.28")
-    testImplementation("org.spockframework:spock-core:2.4-M6-groovy-4.0")
-
-    // Simple SLF4J binding for tests
+    testImplementation("org.spockframework:spock-core:2.3-groovy-4.0")
     testImplementation("org.slf4j:slf4j-simple:2.0.17")
-
-    // These are no longer needed with Spock 2.x:
-    // testRuntimeOnly("cglib:cglib-nodep:3.1")
-    // testRuntimeOnly("org.objenesis:objenesis:2.1")
-
-    // If you still use Joda-Time in tests, keep it but on latest:
-    testImplementation("joda-time:joda-time:2.14.0")
+    testImplementation("joda-time:joda-time:2.14.0") // only if your tests still use it
 }
 
+// Quiet Javadoc
+tasks.withType(Javadoc).configureEach {
+    options.addStringOption('Xdoclint:none', '-quiet')
+}
+
+// JUnit 5
 test {
     useJUnitPlatform()
-    beforeTest { descriptor ->
-        logger.lifecycle("Running test \"${descriptor}\"")
-    }
-    // Always run tests (useful for race-condition checks)
+    beforeTest { d -> logger.lifecycle("Running test \"${d}\"") }
     outputs.upToDateWhen { false }
 }
 
-// Embedded Mongo for tests (plugin v2 syntax remains compatible)
-tasks.withType(Test) {
+// Embedded Mongo (plugin v2)
+tasks.withType(Test).configureEach {
     runWithMongoDb = true
     mongo {
         journalingEnabled true
@@ -117,41 +93,92 @@ tasks.withType(Test) {
     }
 }
 
-// Managed Mongo outside test task if you use it manually
-mongo {
-    port 27017
-    logging 'console'
-    journalingEnabled true
+// ========= Strict per-environment publishing to GitHub Packages =========
+// Select env: -PpublishEnv=dev|stage|prod  OR  PUBLISH_ENV env var (defaults to 'dev')
+def publishEnv = (project.findProperty("publishEnv") ?: System.getenv("PUBLISH_ENV") ?: "dev").toString().toLowerCase()
+def ENV = publishEnv.toUpperCase()
+
+// Helper that fails hard if a required env var is missing
+def req = { String name ->
+    def v = System.getenv(name)
+    if (!v) throw new GradleException("Missing environment variable: " + name + " (required for publishEnv=" + ENV + ")")
+    return v
 }
 
-// Publishing (sources & javadoc jars are auto-added via components.java)
+// No fallbacks: each env must provide its *own* values.
+// Example var names you must set in CI/CSMS:
+//  GPR_OWNER_DEV / GPR_REPO_DEV / GPR_USER_DEV / GPR_TOKEN_DEV
+//  GPR_OWNER_STAGE / GPR_REPO_STAGE / GPR_USER_STAGE / GPR_TOKEN_STAGE
+//  GPR_OWNER_PROD / GPR_REPO_PROD / GPR_USER_PROD / GPR_TOKEN_PROD
+def owner = req("GPR_OWNER_${ENV}")
+def repo = req("GPR_REPO_${ENV}")
+def user = req("GPR_USER_${ENV}")
+def token = req("GPR_TOKEN_${ENV}")
+
+def repoUrl = "https://maven.pkg.github.com/${owner}/${repo}"
+
 publishing {
     publications {
         quartzMongoDB(MavenPublication) {
-            groupId    = 'com.novemberain'
+            groupId = project.group
             artifactId = archivesBaseName
-            version    = projectVersion
+            version = project.version
             from components.java
+
+            pom {
+                name = 'Quartz MongoDB JobStore'
+                packaging = 'jar'
+                description = 'Fork of quartz-mongodb, modernized for Java 17 & latest libs.'
+                url = "https://github.com/${owner}/${repo}"
+                licenses {
+                    license {
+                        name = 'Apache License 2.0'
+                        url = 'http://www.apache.org/licenses/LICENSE-2.0.txt'
+                    }
+                }
+                scm {
+                    url = "https://github.com/${owner}/${repo}"
+                    connection = "scm:git:https://github.com/${owner}/${repo}.git"
+                    developerConnection = "scm:git:git@github.com:${owner}/${repo}.git"
+                }
+            }
         }
     }
-    // repositories {
-    //   maven { url = uri("$buildDir/repo") }
-    // }
+    repositories {
+        maven {
+            name = "GitHubPackages"
+            url = uri(repoUrl)
+            credentials {
+                username = user
+                password = token
+            }
+            authentication { basic(BasicAuthentication) }
+        }
+    }
 }
 
-release {
-    scmAdapters = [net.researchgate.release.GitAdapter]
-    git { pushToRemote = 'origin' }
-    versionPropertyFile = 'gradle.properties'
-}
+// Convenience tasks
+tasks.register("publishDev") { dependsOn("publish"); doFirst { project.ext.set("publishEnv", "dev") } }
+tasks.register("publishStage") { dependsOn("publish"); doFirst { project.ext.set("publishEnv", "stage") } }
+tasks.register("publishProd") { dependsOn("publish"); doFirst { project.ext.set("publishEnv", "prod") } }
 
-// Guardrails: refuse vulnerable/old libs if pulled transitively
+// Guardrails against old/vulnerable transitive versions
 dependencies {
     constraints {
-        implementation("org.quartz-scheduler:quartz:2.5.0") { because("CVE-2019-13990 fixed in ≥2.3.2") }
+        implementation("org.quartz-scheduler:quartz:2.5.0")
         implementation("org.mongodb:mongodb-driver-sync:5.6.0")
         implementation("org.slf4j:slf4j-api:2.0.17")
         implementation("commons-codec:commons-codec:1.19.0")
         implementation("org.apache.commons:commons-lang3:3.19.0")
     }
+}
+
+release {
+    scmAdapters = [net.researchgate.release.GitAdapter]
+    versionPropertyFile = 'gradle.properties'
+    git {
+        requireBranch.set(/release-\d+\.\d+\.\d+/)
+        pushOptions.set(["--force"])
+    }
+    pushReleaseVersionBranch = 'master'
 }
